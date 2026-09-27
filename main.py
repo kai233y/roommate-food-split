@@ -22,7 +22,14 @@ import flet as ft
 from pantry import Pantry, money, quantity
 
 
-DB_PATH = Path(os.environ.get("PANTRY_DB", Path(__file__).parent / "data" / "pantry.db"))
+def default_db_path() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return base / "RoommatePantry" / "pantry.db"
+    return Path(__file__).parent / "data" / "pantry.db"
+
+
+DB_PATH = Path(os.environ.get("PANTRY_DB") or default_db_path())
 COLORS = [ft.Colors.TEAL_600, ft.Colors.BLUE_600, ft.Colors.ORANGE_700]
 
 
@@ -40,14 +47,16 @@ def main(page: ft.Page):
     def tip(message: str):
         page.show_dialog(ft.SnackBar(ft.Text(message)))
 
-    def run_action(action, success: str):
+    def run_action(action, success: str, close_dialog: bool = False):
         try:
             action()
         except (ValueError, OverflowError) as exc:
             tip(str(exc))
             return False
-        tip(success)
+        if close_dialog:
+            page.pop_dialog()
         render()
+        tip(success)
         return True
 
     def heading(title: str, subtitle: str = ""):
@@ -86,9 +95,9 @@ def main(page: ft.Page):
 
         def save(_):
             ids = [id_ for id_, check in checks if check.value]
-            if run_action(lambda: pantry.consume(int(selected.value), amount.value,
-                                                  int(actor.value or 0), ids), "已记录消耗及分摊"):
-                page.pop_dialog()
+            run_action(lambda: pantry.consume(int(selected.value), amount.value,
+                                               int(actor.value or 0), ids),
+                       "已记录消耗及分摊", close_dialog=True)
 
         dialog = ft.AlertDialog(
             modal=True, title=ft.Text("记录食材消耗"),
@@ -114,10 +123,9 @@ def main(page: ft.Page):
         buyer_bears = ft.Checkbox(label="由购买人承担报废金额（默认不计入任何人消耗）")
 
         def save(_):
-            if run_action(lambda: pantry.waste(batch_id, amount.value, int(actor.value or 0),
-                                                reason.value, bool(buyer_bears.value)),
-                          "已记录报废"):
-                page.pop_dialog()
+            run_action(lambda: pantry.waste(batch_id, amount.value, int(actor.value or 0),
+                                             reason.value, bool(buyer_bears.value)),
+                       "已记录报废", close_dialog=True)
 
         page.show_dialog(ft.AlertDialog(
             modal=True, title=ft.Text(f"报废 #{batch_id} {batch['name']}"),
@@ -128,6 +136,8 @@ def main(page: ft.Page):
 
     def overview():
         stats = pantry.summary()
+        period = pantry.current_period()
+        due = date.today().isoformat() >= period["due_on"]
         batches = pantry.batches()
         active = [b for b in batches if b["remaining_milli"] > 0]
         remaining_value = sum(b["remaining_cents"] for b in active)
@@ -171,7 +181,15 @@ def main(page: ft.Page):
                          bgcolor=ft.Colors.TEAL_400, border_radius=5),
             ft.Text(money(value)),
         ], spacing=10) for day, value in history]
-        return [heading("账本总览", "购买贡献、食用分摊和待结算金额一目了然"), tiles,
+        period_notice = card(
+            ft.Text("本期已到结算日" if due else "本期结算提醒",
+                    size=17, weight=ft.FontWeight.BOLD,
+                    color=ft.Colors.ORANGE_700 if due else ft.Colors.TEAL_700),
+            ft.Text(f"#{period['id']} · {'按周' if period['cycle_type']=='week' else '按月'} · "
+                    f"开始 {period['started_at'][:10]} · 到期 {period['due_on']}"),
+            ft.Button("查看谁该给谁付款", on_click=lambda _: select_tab("结算")),
+        )
+        return [heading("账本总览", "购买贡献、食用分摊和待结算金额一目了然"), period_notice, tiles,
             card(ft.Text("室友账目", size=18, weight=ft.FontWeight.BOLD),
                  ft.Row([table], scroll=ft.ScrollMode.AUTO),
                  ft.Text("贡献−消耗 = 累计购买 − 个人食用（含未食用库存）；待结算净额 = 已被食用的贡献 − 个人食用，正数应收、负数应付。报废单列。",
@@ -295,14 +313,67 @@ def main(page: ft.Page):
             card(ft.Row([start, end, ingredient, person, ft.Button("筛选", on_click=search)],
                         wrap=True, spacing=10)), result]
 
+    def settlement_view():
+        report = pantry.period_report()
+        period = report["period"]
+        overdue = date.today().isoformat() >= period["due_on"]
+        cycle = ft.Dropdown(label="结算周期", width=180, value=period["cycle_type"], options=[
+            ft.DropdownOption(key="week", text="按周（7 天）"),
+            ft.DropdownOption(key="month", text="按月（对应日期）")])
+
+        def save_cycle(_):
+            run_action(lambda: pantry.set_cycle_type(cycle.value), "周期设置已保存")
+
+        def transfer_lines(items):
+            return [ft.Text(f"{t['payer']} → {t['receiver']}：{money(t['amount_cents'])}",
+                            size=16, weight=ft.FontWeight.BOLD) for t in items] or [
+                ft.Text("本期暂无需要转账的金额")]
+
+        def confirm_close(_):
+            run_action(lambda: pantry.close_period(), "本期结算单已保存，新周期已开始",
+                       close_dialog=True)
+
+        def ask_close(_):
+            page.show_dialog(ft.AlertDialog(
+                modal=True, title=ft.Text(f"结束第 {period['id']} 期？"),
+                content=ft.Text("将保存以下转账清单并开启下一期。未吃完的食材继续留在库存；本期流水不可再编辑。"),
+                actions=[ft.TextButton("取消", on_click=lambda _: page.pop_dialog()),
+                         ft.Button("确认结束本期", on_click=confirm_close)],
+            ))
+
+        history = []
+        for old in pantry.periods():
+            if old["closed_at"] is None:
+                continue
+            old_report = pantry.period_report(old["id"])
+            history.append(card(
+                ft.Text(f"第 {old['id']} 期 · {old['started_at'][:10]} 至 {old['closed_at'][:10]}",
+                        weight=ft.FontWeight.BOLD),
+                ft.Text(f"食用金额 {money(old_report['consumed_cents'])}"),
+                *transfer_lines(old_report["transfers"]),
+            ))
+        return [heading("周期结算", "按实际食用金额计算转账；购买后尚未食用的库存留到以后结算"),
+            card(ft.Text("当前周期", size=18, weight=ft.FontWeight.BOLD),
+                 ft.Text(f"第 {period['id']} 期 · 开始 {period['started_at'][:10]} · "
+                         f"结算日 {period['due_on']}"),
+                 ft.Text("已到结算日，请生成本期结算单" if overdue else "到期时会在总览页提醒",
+                         color=ft.Colors.ORANGE_700 if overdue else ft.Colors.TEAL_700),
+                 ft.Row([cycle, ft.Button("保存周期设置", on_click=save_cycle)], wrap=True),
+                 ft.Text(f"本期食用金额：{money(report['consumed_cents'])}"),
+                 ft.Text("建议转账", size=16, weight=ft.FontWeight.BOLD),
+                 *transfer_lines(report["transfers"]),
+                 ft.Button("结束本期并开启下一期", on_click=ask_close)),
+            heading("历史结算单"),
+            *(history or [ft.Text("尚未结束任何周期")])]
+
     def render():
-        tabs = ["总览", "室友", "入库", "库存", "流水"]
+        tabs = ["总览", "室友", "入库", "库存", "流水", "结算"]
         navigation = ft.Row([
             ft.Button(t, on_click=lambda _, tab=t: select_tab(tab),
                       bgcolor=ft.Colors.TEAL_100 if t == current_tab else ft.Colors.WHITE)
             for t in tabs], wrap=True, spacing=8)
         views = {"总览": overview, "室友": roommates_view, "入库": purchase_view,
-                 "库存": inventory_view, "流水": ledger_view}
+                 "库存": inventory_view, "流水": ledger_view, "结算": settlement_view}
         content.controls = [ft.Text("合租食材账本", size=16, weight=ft.FontWeight.BOLD,
                                     color=ft.Colors.TEAL_700), navigation, ft.Divider(),
                             *views[current_tab]()]

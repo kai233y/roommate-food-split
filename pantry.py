@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import calendar
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -88,13 +89,133 @@ class Pantry:
             CREATE INDEX IF NOT EXISTS idx_ledger_time ON ledger(occurred_at);
             CREATE INDEX IF NOT EXISTS idx_ledger_batch ON ledger(batch_id);
             CREATE INDEX IF NOT EXISTS idx_alloc_roommate ON allocations(roommate_id);
+            CREATE TABLE IF NOT EXISTS periods (
+                id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                due_on TEXT NOT NULL,
+                cycle_type TEXT NOT NULL CHECK(cycle_type IN ('week', 'month')),
+                start_ledger_id INTEGER NOT NULL,
+                end_ledger_id INTEGER,
+                closed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS settlements (
+                id INTEGER PRIMARY KEY,
+                period_id INTEGER NOT NULL REFERENCES periods(id),
+                payer_id INTEGER NOT NULL REFERENCES roommates(id),
+                receiver_id INTEGER NOT NULL REFERENCES roommates(id),
+                amount_cents INTEGER NOT NULL CHECK(amount_cents > 0)
+            );
         """)
+        self._ensure_period()
 
     def close(self):
         self.db.close()
 
     def _now(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _due_on(started_at: str, cycle_type: str) -> str:
+        started = date.fromisoformat(started_at[:10])
+        if cycle_type == "week":
+            return (started + timedelta(days=7)).isoformat()
+        if cycle_type == "month":
+            year, month = started.year, started.month + 1
+            if month > 12:
+                year, month = year + 1, 1
+            day = min(started.day, calendar.monthrange(year, month)[1])
+            return date(year, month, day).isoformat()
+        raise ValueError("结算周期只能是按周或按月")
+
+    def _ensure_period(self):
+        if self.db.execute("SELECT 1 FROM periods LIMIT 1").fetchone():
+            return
+        first = self.db.execute("SELECT occurred_at FROM ledger ORDER BY id LIMIT 1").fetchone()
+        started = first["occurred_at"] if first else self._now()
+        with self.db:
+            self.db.execute("""INSERT INTO periods
+                (started_at,due_on,cycle_type,start_ledger_id)
+                VALUES(?,?,?,1)""", (started, self._due_on(started, "month"), "month"))
+
+    def current_period(self):
+        return self.db.execute("SELECT * FROM periods WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+
+    def periods(self):
+        return self.db.execute("SELECT * FROM periods ORDER BY id DESC").fetchall()
+
+    def set_cycle_type(self, cycle_type: str):
+        if cycle_type not in ("week", "month"):
+            raise ValueError("请选择按周或按月")
+        period = self.current_period()
+        with self.db:
+            self.db.execute("UPDATE periods SET cycle_type=?,due_on=? WHERE id=?",
+                            (cycle_type, self._due_on(period["started_at"], cycle_type), period["id"]))
+
+    def period_report(self, period_id: int | None = None):
+        period = (self.current_period() if period_id is None else
+                  self.db.execute("SELECT * FROM periods WHERE id=?", (period_id,)).fetchone())
+        if period is None:
+            raise ValueError("结算周期不存在")
+        upper = period["end_ledger_id"]
+        sql = """SELECT l.amount_cents AS operation_cents,b.buyer_id,
+            a.roommate_id AS eater_id,a.amount_cents AS share_cents
+            FROM ledger l JOIN batches b ON b.id=l.batch_id
+            JOIN allocations a ON a.ledger_id=l.id
+            WHERE l.kind='consume' AND l.id>=?"""
+        params = [period["start_ledger_id"]]
+        if upper is not None:
+            sql += " AND l.id<=?"
+            params.append(upper)
+        rows = self.db.execute(sql, params).fetchall()
+        people = {r["id"]: r["name"] for r in self.roommates()}
+        balances = {id_: 0 for id_ in people}
+        consumed = 0
+        for row in rows:
+            consumed += row["share_cents"]
+            if row["buyer_id"] != row["eater_id"]:
+                balances[row["buyer_id"]] += row["share_cents"]
+                balances[row["eater_id"]] -= row["share_cents"]
+        creditors = [[id_, value] for id_, value in balances.items() if value > 0]
+        debtors = [[id_, -value] for id_, value in balances.items() if value < 0]
+        creditors.sort(key=lambda pair: (-pair[1], pair[0]))
+        debtors.sort(key=lambda pair: (-pair[1], pair[0]))
+        transfers = []
+        ci = di = 0
+        while ci < len(creditors) and di < len(debtors):
+            payer, debt = debtors[di]
+            receiver, credit = creditors[ci]
+            amount = min(debt, credit)
+            transfers.append({"payer_id": payer, "payer": people[payer],
+                              "receiver_id": receiver, "receiver": people[receiver],
+                              "amount_cents": amount})
+            debtors[di][1] -= amount
+            creditors[ci][1] -= amount
+            if debtors[di][1] == 0:
+                di += 1
+            if creditors[ci][1] == 0:
+                ci += 1
+        return {"period": period, "consumed_cents": consumed,
+                "balances": [{"id": id_, "name": people[id_], "cents": value}
+                             for id_, value in balances.items()],
+                "transfers": transfers}
+
+    def close_period(self):
+        with self.db:
+            report = self.period_report()
+            period = report["period"]
+            last = self.db.execute("SELECT COALESCE(MAX(id),0) FROM ledger").fetchone()[0]
+            now = self._now()
+            self.db.execute("""UPDATE periods SET end_ledger_id=?,closed_at=?
+                WHERE id=? AND closed_at IS NULL""", (last, now, period["id"]))
+            self.db.executemany("""INSERT INTO settlements
+                (period_id,payer_id,receiver_id,amount_cents) VALUES(?,?,?,?)""",
+                [(period["id"], t["payer_id"], t["receiver_id"], t["amount_cents"])
+                 for t in report["transfers"]])
+            self.db.execute("""INSERT INTO periods
+                (started_at,due_on,cycle_type,start_ledger_id)
+                VALUES(?,?,?,?)""", (now, self._due_on(now, period["cycle_type"]),
+                                      period["cycle_type"], last + 1))
+            return period["id"]
 
     def roommates(self):
         return self.db.execute("SELECT * FROM roommates ORDER BY id").fetchall()

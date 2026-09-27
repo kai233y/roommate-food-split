@@ -50,6 +50,36 @@ class PantryTests(unittest.TestCase):
         self.assertEqual(sum(row["consumed"] for row in s), 3)
         self.assertEqual(self.p.batches()[0]["remaining_cents"], 0)
 
+    def test_period_transfers_and_stock_carry_forward(self):
+        beef = self.p.purchase("牛肉", "weight", "50", "1", self.a, "2026-09-27", "3")
+        self.p.consume(beef, "0.5", self.b, [self.b, self.c])
+        report = self.p.period_report()
+        self.assertEqual(report["consumed_cents"], 2500)
+        self.assertEqual([(t["payer"], t["receiver"], t["amount_cents"])
+                          for t in report["transfers"]],
+                         [("B", "A", 1250), ("C", "A", 1250)])
+        self.p.set_cycle_type("week")
+        first_id = self.p.close_period()
+        self.assertEqual(self.p.current_period()["cycle_type"], "week")
+        self.assertEqual(self.p.period_report()["transfers"], [])
+        self.assertEqual(self.p.batches()[0]["remaining_milli"], 500)
+        self.assertEqual(self.p.db.execute(
+            "SELECT count(*) FROM settlements WHERE period_id=?", (first_id,)).fetchone()[0], 2)
+        self.p.consume(beef, "0.5", self.b, [self.b, self.c])
+        self.assertEqual(self.p.period_report()["consumed_cents"], 2500)
+        self.assertEqual(self.p.period_report(first_id)["consumed_cents"], 2500)
+
+    def test_period_netting_and_due_dates(self):
+        a_food = self.p.purchase("A的菜", "piece", "10", "1", self.a, "2026-09-27", "7")
+        b_food = self.p.purchase("B的菜", "piece", "4", "1", self.b, "2026-09-27", "7")
+        self.p.consume(a_food, "1", self.b, [self.b])
+        self.p.consume(b_food, "1", self.a, [self.a])
+        transfers = self.p.period_report()["transfers"]
+        self.assertEqual([(t["payer"], t["receiver"], t["amount_cents"]) for t in transfers],
+                         [("B", "A", 600)])
+        self.assertEqual(Pantry._due_on("2026-01-31T10:00:00", "month"), "2026-02-28")
+        self.assertEqual(Pantry._due_on("2026-09-27T10:00:00", "week"), "2026-10-04")
+
 
 if __name__ == "__main__":
     unittest.main()
