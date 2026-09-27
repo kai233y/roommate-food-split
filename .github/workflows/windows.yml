@@ -13,7 +13,14 @@ jobs:
           python-version: '3.12'
       - name: Build executable
         shell: pwsh
-        run: ./build_windows.ps1
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt 'pyinstaller>=6,<7'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m unittest discover -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\flet.exe pack main.py --name RoommatePantry --yes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
