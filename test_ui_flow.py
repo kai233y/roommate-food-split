@@ -2,7 +2,9 @@
 
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 import flet as ft
 
@@ -38,21 +40,22 @@ class ModalFlowTests(unittest.TestCase):
             pantry.purchase("牛肉", "weight", "50", "1", buyer, "2026-09-27", "7")
             pantry.close()
 
-            page = FakePage()
-            app.main(page)
-            page.content.controls[1].controls[3].on_click(None)  # 库存
-            page.content.controls[4].controls[0].on_click(None)  # 记录消耗
-            dialog = page.dialogs[-1]
-            dialog.content.controls[1].controls[0].value = "0.5"
-            dialog.content.controls[1].controls[1].value = str(eater)
-            dialog.content.controls[3].controls[1].value = True
-            dialog.actions[1].on_click(None)
+            with closing(Pantry(app.DB_PATH)) as ui_pantry:
+                with patch.object(app, "Pantry", return_value=ui_pantry):
+                    page = FakePage()
+                    app.main(page)
+                page.content.controls[1].controls[3].on_click(None)  # 库存
+                page.content.controls[4].controls[0].on_click(None)  # 记录消耗
+                dialog = page.dialogs[-1]
+                dialog.content.controls[1].controls[0].value = "0.5"
+                dialog.content.controls[1].controls[1].value = str(eater)
+                dialog.content.controls[3].controls[1].value = True
+                dialog.actions[1].on_click(None)
 
-            self.assertEqual(len(page.dialogs), 1)
-            self.assertIsInstance(page.dialogs[0], ft.SnackBar)
-            check = Pantry(app.DB_PATH)
-            self.assertEqual(check.batches()[0]["remaining_milli"], 500)
-            check.close()
+                self.assertEqual(len(page.dialogs), 1)
+                self.assertIsInstance(page.dialogs[0], ft.SnackBar)
+                with closing(Pantry(app.DB_PATH)) as check:
+                    self.assertEqual(check.batches()[0]["remaining_milli"], 500)
 
     def test_period_close_shows_new_cycle_and_saved_transfer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,20 +67,21 @@ class ModalFlowTests(unittest.TestCase):
             pantry.consume(batch, "0.5", eater, [eater])
             pantry.close()
 
-            page = FakePage()
-            app.main(page)
-            page.content.controls[1].controls[5].on_click(None)  # 结算
-            settlement_card = page.content.controls[4]
-            settlement_card.content.controls[-1].on_click(None)  # 结束本期
-            self.assertIsInstance(page.dialogs[-1], ft.AlertDialog)
-            page.dialogs[-1].actions[1].on_click(None)
+            with closing(Pantry(app.DB_PATH)) as ui_pantry:
+                with patch.object(app, "Pantry", return_value=ui_pantry):
+                    page = FakePage()
+                    app.main(page)
+                page.content.controls[1].controls[5].on_click(None)  # 结算
+                settlement_card = page.content.controls[4]
+                settlement_card.content.controls[-1].on_click(None)  # 结束本期
+                self.assertIsInstance(page.dialogs[-1], ft.AlertDialog)
+                page.dialogs[-1].actions[1].on_click(None)
 
-            self.assertEqual(len(page.dialogs), 1)
-            self.assertIsInstance(page.dialogs[0], ft.SnackBar)
-            check = Pantry(app.DB_PATH)
-            self.assertEqual(check.current_period()["id"], 2)
-            self.assertEqual(check.period_report(1)["transfers"][0]["amount_cents"], 2500)
-            check.close()
+                self.assertEqual(len(page.dialogs), 1)
+                self.assertIsInstance(page.dialogs[0], ft.SnackBar)
+                with closing(Pantry(app.DB_PATH)) as check:
+                    self.assertEqual(check.current_period()["id"], 2)
+                    self.assertEqual(check.period_report(1)["transfers"][0]["amount_cents"], 2500)
 
 
 if __name__ == "__main__":
