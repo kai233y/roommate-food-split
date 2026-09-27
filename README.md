@@ -54,6 +54,15 @@ python -m unittest discover -p 'test_*.py' -v
 
 ## Windows 免 Python 运行包
 
-在 Windows 10/11（64 位）电脑上安装 Python 3.12 后，在本目录的 PowerShell 中运行 `./build_windows.ps1`。脚本会执行测试并生成 `dist/RoommatePantry.exe`。把这个 exe 复制到其他 Windows 电脑即可运行，目标电脑无需安装 Python。
+在 Windows 10/11（64 位）电脑上安装 Python 3.12 后，在本目录的 PowerShell 中运行：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt 'pyinstaller>=6,<7'
+.\.venv\Scripts\python.exe -m unittest discover -p 'test_*.py' -v
+.\.venv\Scripts\flet.exe pack main.py --name RoommatePantry --yes
+```
+
+生成的 `dist/RoommatePantry.exe` 可复制到其他 Windows 电脑运行，目标电脑无需安装 Python。
 
 也可以把本目录内容放在 GitHub 仓库根目录，再在 Actions 页手动运行 **Build Windows executable** 工作流，下载 `RoommatePantry-Windows` 构建产物。macOS 无法直接构建 Windows exe，因此需要 Windows 机器或 Windows CI 运行器。
